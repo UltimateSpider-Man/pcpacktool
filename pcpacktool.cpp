@@ -1,18 +1,14 @@
-﻿// pcpack_tool.cpp — Ultimate Spider-Man PCPACK importer/exporter
-// C++17 single-file. Mirrors the provided Python logic (read_pcpack + build_pack).
-// - Export: dumps every resource payload using names from string_hash_dictionary.txt + platform ext table.
-// - Import: writes a new pack by copying headers + resource_directory blob, re-emitting vector data
-//           with the same alignment scheme, then rewriting payloads at their original offsets.
-//           Pads file end to match original size.
+// pcpack_tool.cpp - Ultimate Spider-Man PCPACK full export/reimport with offset fixup
+// Handles the 0x1020 byte header structure and updates ALL location offsets
 //
-// Notes:
-// * We DO NOT attempt to rebuild or re-link the in-file pointers; we preserve the original directory
-//   and only replace payload bytes (this is exactly what your Python build did).
-// * Align rules replicate Python rebase(): align 8 then 4, then arrays, using 0xE3 fill bytes in the mash area.
-// * Offsets for payloads are computed as base + res_loc.m_offset where base = pack_header.res_dir_mash_size.
-// * TL vectors are parsed to validate structure, but they’re not used for export/import decisions.
+// Build (MinGW/Linux):
+//   g++ -std=c++17 -O2 pcpack_tool.cpp -o pcpack_tool
+// Build (MSVC):
+//   cl /std:c++17 /O2 pcpack_tool.cpp
 //
-// Author: ChatGPT (GPT-5 Thinking)
+// Usage:
+//   pcpack_tool export <input.pcpack> [output_dir] [dict.txt]
+//   pcpack_tool import <original.pcpack> <input_dir> <output.pcpack> [--align N]
 
 #include <cstdint>
 #include <cstdio>
@@ -20,7 +16,6 @@
 #include <cstring>
 #include <string>
 #include <vector>
-#include <array>
 #include <unordered_map>
 #include <fstream>
 #include <sstream>
@@ -30,656 +25,668 @@
 
 namespace fs = std::filesystem;
 
-static inline void fail(const char* msg) {
-    throw std::runtime_error(msg);
-}
+// ==================== Structures ====================
 
-static inline void ensure(bool cond, const char* msg) {
-    if (!cond) fail(msg);
-}
+#pragma pack(push, 1)
 
-template<class T>
-static inline T read_le(const uint8_t* p) {
-    // Pack structs are little-endian on PC — but we use packed C structs so this is just helper if needed.
-    T v{};
-    std::memcpy(&v, p, sizeof(T));
-    return v;
-}
-
-// -------- File helpers
-static inline std::vector<uint8_t> read_file_bin(const fs::path& p) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f) fail(("Cannot open file: " + p.string()).c_str());
-    f.seekg(0, std::ios::end);
-    auto sz = f.tellg();
-    f.seekg(0, std::ios::beg);
-    std::vector<uint8_t> buf((size_t)sz);
-    if (sz > 0) f.read((char*)buf.data(), (std::streamsize)buf.size());
-    return buf;
-}
-
-static inline void write_file_bin(const fs::path& p, const std::vector<uint8_t>& data) {
-    std::ofstream f(p, std::ios::binary);
-    if (!f) fail(("Cannot write file: " + p.string()).c_str());
-    if (!data.empty()) f.write((const char*)data.data(), (std::streamsize)data.size());
-}
-
-// -------- Packed structs (mirror Python ctypes sizes)
-#pragma pack(push,1)
-
-struct resource_versions { // 0x14
-    uint32_t field_0;
-    uint32_t field_4;
-    uint32_t field_8;
-    uint32_t field_C;
-    uint32_t field_10;
+struct resource_versions {
+    uint32_t field_0, field_4, field_8, field_C, field_10;
 };
-static_assert(sizeof(resource_versions) == 0x14, "resource_versions size mismatch");
+static_assert(sizeof(resource_versions) == 0x14, "");
 
-struct resource_pack_header { // 0x2C
-    resource_versions field_0;   // 0x00..0x13
-    uint32_t          field_14;  // 0x14
-    uint32_t          directory_offset;      // 0x18
-    uint32_t          res_dir_mash_size;     // 0x1C (base)
-    uint32_t          field_20;  // 0x20
-    uint32_t          field_24;  // 0x24
-    uint32_t          field_28;  // 0x28
+struct resource_pack_header {
+    resource_versions field_0;      // 0x00-0x13
+    uint32_t          field_14;     // 0x14
+    uint32_t          directory_offset;  // 0x18 - typically 0x30
+    uint32_t          res_dir_mash_size; // 0x1C - base offset where payloads start (0x1020)
+    uint32_t          field_20;     // 0x20
+    uint32_t          field_24;     // 0x24
+    uint32_t          field_28;     // 0x28
 };
-static_assert(sizeof(resource_pack_header) == 0x2C, "resource_pack_header size mismatch");
+static_assert(sizeof(resource_pack_header) == 0x2C, "");
 
-struct generic_mash_header { // 0x10
-    int32_t safety_key;
-    int32_t field_4;
-    int32_t field_8;   // offset to mash data (relative to this header's base area)
-    int16_t class_id;
-    int16_t field_E;
+struct generic_mash_header {
+    int32_t safety_key;   // 0x00
+    int32_t field_4;      // 0x04
+    int32_t field_8;      // 0x08 - total size of mash data
+    int16_t class_id;     // 0x0C
+    int16_t field_E;      // 0x0E
 };
-static_assert(sizeof(generic_mash_header) == 0x10, "generic_mash_header size mismatch");
+static_assert(sizeof(generic_mash_header) == 0x10, "");
 
-struct string_hash { // 0x4
+struct string_hash {
     uint32_t source_hash_code;
-    bool operator==(const string_hash& o) const { return source_hash_code == o.source_hash_code; }
-    bool operator!=(const string_hash& o) const { return !(*this == o); }
 };
 
-struct resource_key { // 0x8
-    string_hash m_hash; // 0x0
-    uint32_t    m_type; // 0x4
+struct resource_key {
+    string_hash m_hash;
+    uint32_t    m_type;
 };
 
-struct resource_location { // 0x10
-    resource_key field_0; // 0x00
-    uint32_t     m_offset;// 0x08 (relative to base)
-    uint32_t     m_size;  // 0x0C
+struct resource_location {
+    resource_key field_0;
+    uint32_t     m_offset;  // relative to base (res_dir_mash_size)
+    uint32_t     m_size;
 };
-static_assert(sizeof(resource_location) == 0x10, "resource_location size mismatch");
+static_assert(sizeof(resource_location) == 0x10, "");
 
 template<typename T>
-struct mashable_vector_t { // 8 bytes
-    // Matches your Python: (T* m_data; uint16_t m_size; bool m_shared; bool field_7)
-    // We only trust m_size + field_7 flags; m_data is an in-file pointer we DO NOT dereference.
-    uint32_t m_data;   // on-disk pointer/offset placeholder (ignored)
-    uint16_t m_size;
+struct mashable_vector_t {
+    uint32_t m_data;    // on-disk pointer placeholder
+    uint16_t m_size;    // element count
     uint8_t  m_shared;
     uint8_t  field_7;
 };
-static_assert(sizeof(mashable_vector_t<uint32_t>) == 8, "mashable_vector_t size mismatch");
+static_assert(sizeof(mashable_vector_t<uint32_t>) == 8, "");
 
-struct tlresource_location { // 0xC
-    string_hash name;   // 0x0
-    uint8_t     type;   // 0x4 (c_char in Python)
-    uint8_t     pad[3]; // padding to keep sizes consistent
-    uint32_t    offset; // 0x8
+struct tlresource_location {
+    string_hash name;
+    uint8_t     type;
+    uint8_t     pad[3];
+    uint32_t    offset;  // relative to base
 };
-static_assert(sizeof(tlresource_location) == 0x0C, "tlresource_location size mismatch");
+static_assert(sizeof(tlresource_location) == 0x0C, "");
 
-// We only need the parts we actually use during (un)mash. Keep exact size = 0x2BC.
-struct resource_directory { // 0x2BC
-    // 0x00
-    mashable_vector_t<int32_t>          parents;                // vector<int>
-    mashable_vector_t<resource_location> resource_locations;    // vector<resource_location>
-    mashable_vector_t<tlresource_location> texture_locations;
-    mashable_vector_t<tlresource_location> mesh_file_locations;
-    mashable_vector_t<tlresource_location> mesh_locations;
-    mashable_vector_t<tlresource_location> morph_file_locations;
-    mashable_vector_t<tlresource_location> morph_locations;
-    mashable_vector_t<tlresource_location> material_file_locations;
-    mashable_vector_t<tlresource_location> material_locations;
-    mashable_vector_t<tlresource_location> anim_file_locations;
-    mashable_vector_t<tlresource_location> anim_locations;
-    mashable_vector_t<tlresource_location> scene_anim_locations;
-    mashable_vector_t<tlresource_location> skeleton_locations;
-    // 13 * 8 = 104 bytes so far
-
-    // Next fields we don’t rely on but must preserve size:
-    mashable_vector_t<int32_t> field_68;  // 8
-    mashable_vector_t<int32_t> field_70;  // 8
-
-    int32_t pack_slot; // 4
-    int32_t base;      // 4
-    int32_t field_80;  // 4
-    int32_t field_84;  // 4
-    int32_t field_88;  // 4
-
-    int32_t type_start_idxs[70]; // 70*4 = 280
-    int32_t type_end_idxs[70];   // 70*4 = 280
+struct resource_directory {
+    mashable_vector_t<int32_t>             parents;               // 0x00
+    mashable_vector_t<resource_location>   resource_locations;    // 0x08
+    mashable_vector_t<tlresource_location> texture_locations;     // 0x10
+    mashable_vector_t<tlresource_location> mesh_file_locations;   // 0x18
+    mashable_vector_t<tlresource_location> mesh_locations;        // 0x20
+    mashable_vector_t<tlresource_location> morph_file_locations;  // 0x28
+    mashable_vector_t<tlresource_location> morph_locations;       // 0x30
+    mashable_vector_t<tlresource_location> material_file_locations; // 0x38
+    mashable_vector_t<tlresource_location> material_locations;    // 0x40
+    mashable_vector_t<tlresource_location> anim_file_locations;   // 0x48
+    mashable_vector_t<tlresource_location> anim_locations;        // 0x50
+    mashable_vector_t<tlresource_location> scene_anim_locations;  // 0x58
+    mashable_vector_t<tlresource_location> skeleton_locations;    // 0x60
+    mashable_vector_t<int32_t>             field_68;              // 0x68
+    mashable_vector_t<int32_t>             field_70;              // 0x70
+    int32_t pack_slot;     // 0x78
+    int32_t base;          // 0x7C - same as res_dir_mash_size
+    int32_t field_80;      // 0x80
+    int32_t field_84;      // 0x84
+    int32_t field_88;      // 0x88
+    int32_t type_start_idxs[70]; // 0x8C
+    int32_t type_end_idxs[70];   // 0x1A4
 };
-static_assert(sizeof(resource_directory) == 0x2BC, "resource_directory size mismatch");
+static_assert(sizeof(resource_directory) == 0x2BC, "");
 
 #pragma pack(pop)
 
-// ---- TLRESOURCE TYPEs (only for sanity checks)
-enum {
-    TLRESOURCE_TYPE_NONE = 0,
-    TLRESOURCE_TYPE_TEXTURE = 1,
-    TLRESOURCE_TYPE_MESH_FILE = 2,
-    TLRESOURCE_TYPE_MESH = 3,
-    TLRESOURCE_TYPE_MORPH_FILE = 4,
-    TLRESOURCE_TYPE_MORPH = 5,
-    TLRESOURCE_TYPE_MATERIAL_FILE = 6,
-    TLRESOURCE_TYPE_MATERIAL = 7,
-    TLRESOURCE_TYPE_ANIM_FILE = 8,
-    TLRESOURCE_TYPE_ANIM = 9,
-    TLRESOURCE_TYPE_SCENE_ANIM = 10,
-    TLRESOURCE_TYPE_SKELETON = 11,
-    TLRESOURCE_TYPE_Z = 12
+// ==================== Type Extension Table ====================
+
+static const std::vector<std::string> resource_type_ext = {
+    ".NONE",     // 0
+    ".PCANIM",   // 1
+    ".PCSKEL",   // 2
+    ".ALS",      // 3
+    ".ENT",      // 4
+    ".ENTEXT",   // 5
+    ".DDS",      // 6
+    ".DDSMP",    // 7
+    ".IFL",      // 8
+    ".DESC",     // 9
+    ".ENS",      // 10
+    ".SPL",      // 11
+    ".AB",       // 12
+    ".QP",       // 13
+    ".TRIG",     // 14
+    ".PCSX",     // 15
+    ".INST",     // 16
+    ".FDF",      // 17
+    ".PANEL",    // 18
+    ".TXT",      // 19
+    ".ICN",      // 20
+    ".PCMESH",   // 21
+    ".PCMORPH",  // 22
+    ".PCMAT",    // 23
+    ".COLL",     // 24
+    ".PCPACK",   // 25
+    ".PCSANIM",  // 26
+    ".MSN",      // 27
+    ".MARKER",   // 28
+    ".HH",       // 29
+    ".WAV",      // 30
+    ".WBK",      // 31
+    ".M2V",      // 32
+    "M2V",       // 33
+    ".PFX",      // 34
+    ".CSV",      // 35
+    ".CLE",      // 36
+    ".LIT",      // 37
+    ".GRD",      // 38
+    ".GLS",      // 39
+    ".LOD",      // 40
+    ".SIN",      // 41
+    ".GV",       // 42
+    ".SV",       // 43
+    ".TOKENS",   // 44
+    ".DSG",      // 45
+    ".PATH",     // 46
+    ".PTRL",     // 47
+    ".LANG",     // 48
+    ".SLF",      // 49
+    ".VISEME",   // 50
+    ".PCMESHDEF",// 51
+    ".PCMORPHDEF",// 52
+    ".PCMATDEF", // 53
+    ".MUT",      // 54
+    ".ASG",      // 55
+    ".BAI",      // 56
+    ".CUT",      // 57
+    ".INTERACT", // 58
+    ".CSV",      // 59
+    ".CSV",      // 60
+    "._ENTID_",  // 61
+    "._ANIMID_", // 62
+    "._REGIONID_",// 63
+    "._AI_GENERIC_ID_",// 64
+    "._RADIOMSG_",// 65
+    "._GOAL_",   // 66
+    "._IFC_ATTRIBUTE_",// 67
+    "._SIGNAL_", // 68
+    "._PACKGROUP_"// 69
 };
 
-enum {
-    RESOURCE_KEY_TYPE_NONE = 0,
-    RESOURCE_KEY_TYPE_MESH_FILE_STRUCT = 51,
-    RESOURCE_KEY_TYPE_MATERIAL_FILE_STRUCT = 53,
-    RESOURCE_KEY_TYPE_Z = 70
-};
+// ==================== Helpers ====================
 
-// -------- platform ext table
-static const std::vector<std::string> resource_key_type_ext = {
-    ".NONE",".PCANIM",".PCSKEL",".ALS",".ENT",".ENTEXT",".DDS",".DDSMP",".IFL",".DESC",".ENS",".SPL",".AB",".QP",".TRIG",".PCSX",".INST",".FDF",".PANEL",".TXT",".ICN",
-    ".PCMESH",".PCMORPH",".PCMAT",".COLL",".PCPACK",".PCSANIM",".MSN",".MARKER",".HH",".WAV",".WBK",
-    ".M2V","M2V",".PFX",".CSV",".CLE",".LIT",".GRD",".GLS",".LOD",".SIN",
-    ".GV",".SV",".TOKENS",".DSG",".PATH",".PTRL",".LANG",".SLF",".VISEME",".PCMESHDEF",".PCMORPHDEF",".PCMATDEF",".MUT",".ASG",".BAI",".CUT",".INTERACT",".CSV",".CSV","._ENTID_","._ANIMID_","._REGIONID_","._AI_GENERIC_ID_","._RADIOMSG_","._GOAL_","._IFC_ATTRIBUTE_","._SIGNAL_","._PACKGROUP_"
-};
-
-// -------- string hash dictionary
 static std::unordered_map<uint32_t, std::string> g_hashDict;
 
-static void load_hash_dictionary(const fs::path& dictPath) {
-    if (dictPath.empty()) return;
-    std::ifstream f(dictPath);
-    if (!f) fail(("Could not open dictionary: " + dictPath.string()).c_str());
+static void load_hash_dictionary(const fs::path& path) {
+    if (path.empty() || !fs::exists(path)) return;
+    std::ifstream f(path);
+    if (!f) return;
     std::string line;
-    size_t lineNo = 0;
     while (std::getline(f, line)) {
-        ++lineNo;
         if (line.empty()) continue;
         std::istringstream iss(line);
-        std::string hx, name;
-        if (!(iss >> hx >> name)) continue;
-        // Expect "0xDEADBEEF name"
-        if (hx.rfind("0x", 0) == 0 || hx.rfind("0X", 0) == 0) {
-            uint32_t v = (uint32_t)std::stoul(hx, nullptr, 16);
+        std::string hex_str, name;
+        if (!(iss >> hex_str >> name)) continue;
+        if (hex_str.size() >= 2 && (hex_str[0] == '0' && (hex_str[1] == 'x' || hex_str[1] == 'X'))) {
+            uint32_t v = (uint32_t)std::stoul(hex_str, nullptr, 16);
             g_hashDict[v] = name;
         }
     }
-    ensure(!g_hashDict.empty(), "string_hash_dictionary.txt is empty or invalid");
+    printf("Loaded %zu hash entries from dictionary\n", g_hashDict.size());
 }
 
-// -------- align helpers
-static inline size_t align_up(size_t x, size_t i) {
-    size_t m = x % i;
-    return m ? (x + (i - m)) : x;
+static std::string get_ext(uint32_t type) {
+    return (type < resource_type_ext.size()) ? resource_type_ext[type] : ".UNK";
 }
 
-static inline void write_align_with(uint8_t fillByte, std::vector<uint8_t>& out, size_t i) {
-    size_t want = align_up(out.size(), i);
-    if (want > out.size()) out.insert(out.end(), want - out.size(), fillByte);
-}
-
-// -------- small name helpers
-static std::string platform_ext(uint32_t type) {
-    if (type < resource_key_type_ext.size()) return resource_key_type_ext[type];
-    return ".UNK";
-}
-
-static std::string platform_name(uint32_t hash, uint32_t type) {
+static std::string get_filename(uint32_t hash, uint32_t type) {
     auto it = g_hashDict.find(hash);
-    char hx[11]; // 0xFFFFFFFF + NUL
-    std::snprintf(hx, sizeof(hx), "0x%08X", hash);
-    std::string base = (it != g_hashDict.end()) ? it->second : std::string(hx);
-    return base + platform_ext(type);
+    char hex[16];
+    snprintf(hex, sizeof(hex), "0x%08X", hash);
+    std::string base = (it != g_hashDict.end()) ? it->second : std::string(hex);
+    return base + get_ext(type);
 }
 
-// -------- parsing the pack "directory + vectors" like Python
+static std::string sanitize_filename(const std::string& name) {
+    std::string result = name;
+    for (char& c : result) {
+        if (c < 32 || c == ':' || c == '*' || c == '?' || c == '"' ||
+            c == '<' || c == '>' || c == '|' || c == '/' || c == '\\')
+            c = '_';
+    }
+    return result;
+}
+
+static std::vector<uint8_t> read_file(const fs::path& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("Cannot open: " + path.string());
+    f.seekg(0, std::ios::end);
+    size_t sz = (size_t)f.tellg();
+    f.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data(sz);
+    if (sz > 0) f.read((char*)data.data(), sz);
+    return data;
+}
+
+static void write_file(const fs::path& path, const std::vector<uint8_t>& data) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("Cannot write: " + path.string());
+    if (!data.empty()) f.write((const char*)data.data(), data.size());
+}
+
+static size_t align_up(size_t x, size_t a) {
+    if (a <= 1) return x;
+    size_t m = x % a;
+    return m ? x + (a - m) : x;
+}
+
+// ==================== Parsed PCPACK ====================
 
 struct ParsedPack {
-    resource_pack_header packHeader{};
-    generic_mash_header  mashHeader{};
-    resource_directory   dir{};
-    std::vector<resource_location> resLocs;    // size = dir.resource_locations.m_size
-    // TL vectors (for sanity only)
-    std::vector<tlresource_location> textures, mesh_files, meshes, morph_files, morphs,
-        material_files, materials, anim_files, anims, scene_anims, skeletons;
-
-    std::vector<uint8_t> wholeFile; // original bytes to copy from
+    std::vector<uint8_t> raw;
+    
+    resource_pack_header pack_header;
+    generic_mash_header  mash_header;
+    resource_directory   dir;
+    
+    std::vector<int32_t>             parents;
+    std::vector<resource_location>   res_locs;
+    std::vector<tlresource_location> textures;
+    std::vector<tlresource_location> mesh_files;
+    std::vector<tlresource_location> meshes;
+    std::vector<tlresource_location> morph_files;
+    std::vector<tlresource_location> morphs;
+    std::vector<tlresource_location> material_files;
+    std::vector<tlresource_location> materials;
+    std::vector<tlresource_location> anim_files;
+    std::vector<tlresource_location> anims;
+    std::vector<tlresource_location> scene_anims;
+    std::vector<tlresource_location> skeletons;
+    
+    uint32_t base() const { return pack_header.res_dir_mash_size; }
 };
 
-static void read_exact(std::ifstream& f, void* dst, size_t n) {
-    f.read((char*)dst, (std::streamsize)n);
-    if (f.gcount() != (std::streamsize)n) fail("Unexpected EOF");
-}
-
-// Unmash according to your Python: after resource_directory blob:
-//   align 8 -> align 4 -> parents (u32 * size 1 used) -> align 4
-//   Then for each vector: align 8 -> align 4 -> read array -> align 4
-static void parse_vectors_after_directory(std::ifstream& f, ParsedPack& P) {
-    auto rebase = [&](size_t i) {
-        auto pos = (size_t)f.tellg();
-        size_t want = align_up(pos, i);
-        if (want > pos) {
-            f.seekg((std::streamoff)(want), std::ios::beg);
-        }
-        };
-
-    rebase(8);
-    rebase(4);
-
-    // parents: Python only wrote one int back; read the count though.
-    if (P.dir.parents.m_size > 0) {
-        // Move to current position and read m_size * 4 (but most packs have tiny parents)
-        std::vector<uint32_t> parents(P.dir.parents.m_size);
-        read_exact(f, parents.data(), parents.size() * sizeof(uint32_t));
-    }
-
-    rebase(4);
-
-    auto read_tl_vec = [&](uint16_t count, std::vector<tlresource_location>& dst) {
-        rebase(8);
-        rebase(4);
-        if (count) {
-            dst.resize(count);
-            read_exact(f, dst.data(), count * sizeof(tlresource_location));
-        }
-        rebase(4);
-        };
-
-    auto read_resloc_vec = [&](uint16_t count, std::vector<resource_location>& dst) {
-        rebase(8);
-        rebase(4);
-        if (count) {
-            dst.resize(count);
-            read_exact(f, dst.data(), count * sizeof(resource_location));
-        }
-        rebase(4);
-        };
-
-    read_resloc_vec(P.dir.resource_locations.m_size, P.resLocs);
-
-    read_tl_vec(P.dir.texture_locations.m_size, P.textures);
-    read_tl_vec(P.dir.mesh_file_locations.m_size, P.mesh_files);
-    read_tl_vec(P.dir.mesh_locations.m_size, P.meshes);
-    read_tl_vec(P.dir.morph_file_locations.m_size, P.morph_files);
-    read_tl_vec(P.dir.morph_locations.m_size, P.morphs);
-    read_tl_vec(P.dir.material_file_locations.m_size, P.material_files);
-    read_tl_vec(P.dir.material_locations.m_size, P.materials);
-    read_tl_vec(P.dir.anim_file_locations.m_size, P.anim_files);
-    read_tl_vec(P.dir.anim_locations.m_size, P.anims);
-    read_tl_vec(P.dir.scene_anim_locations.m_size, P.scene_anims);
-    read_tl_vec(P.dir.skeleton_locations.m_size, P.skeletons);
-}
-
-static ParsedPack parse_pack(const fs::path& inPath) {
+static ParsedPack parse_pcpack(const fs::path& path) {
     ParsedPack P;
-    P.wholeFile = read_file_bin(inPath);
-
-    std::ifstream f(inPath, std::ios::binary);
-    if (!f) fail(("Cannot open pack: " + inPath.string()).c_str());
-
-    // Header
-    read_exact(f, &P.packHeader, sizeof(P.packHeader));
-
-    // Jump to directory_offset and read mash header + directory
-    f.seekg((std::streamoff)P.packHeader.directory_offset, std::ios::beg);
-    read_exact(f, &P.mashHeader, sizeof(P.mashHeader));
-
-    read_exact(f, &P.dir, sizeof(P.dir));
-
-    // Basic checks similar to Python prints
-    if (P.packHeader.field_0.field_0 == 14) {
-        // USM NTSC 1.0
-    }
-    else if (P.packHeader.field_0.field_0 == 10) {
-        // USM Prototype 2005-06-20
-    }
-
-    // Unmash vectors (just read arrays in place following directory struct)
-    parse_vectors_after_directory(f, P);
-
+    P.raw = read_file(path);
+    
+    if (P.raw.size() < sizeof(resource_pack_header))
+        throw std::runtime_error("File too small for header");
+    
+    memcpy(&P.pack_header, P.raw.data(), sizeof(P.pack_header));
+    
+    uint32_t dir_off = P.pack_header.directory_offset;
+    if (dir_off + sizeof(generic_mash_header) + sizeof(resource_directory) > P.raw.size())
+        throw std::runtime_error("Invalid directory offset");
+    
+    memcpy(&P.mash_header, &P.raw[dir_off], sizeof(P.mash_header));
+    memcpy(&P.dir, &P.raw[dir_off + sizeof(generic_mash_header)], sizeof(P.dir));
+    
+    // Parse vector data after directory
+    size_t pos = dir_off + sizeof(generic_mash_header) + sizeof(resource_directory);
+    
+    auto read_align = [&]() {
+        pos = align_up(pos, 8);
+        pos = align_up(pos, 4);
+    };
+    
+    auto read_i32_vec = [&](uint16_t count) -> std::vector<int32_t> {
+        read_align();
+        std::vector<int32_t> v(count);
+        if (count > 0) {
+            memcpy(v.data(), &P.raw[pos], count * sizeof(int32_t));
+            pos += count * sizeof(int32_t);
+        }
+        pos = align_up(pos, 4);
+        return v;
+    };
+    
+    auto read_res_locs = [&](uint16_t count) -> std::vector<resource_location> {
+        read_align();
+        std::vector<resource_location> v(count);
+        if (count > 0) {
+            memcpy(v.data(), &P.raw[pos], count * sizeof(resource_location));
+            pos += count * sizeof(resource_location);
+        }
+        pos = align_up(pos, 4);
+        return v;
+    };
+    
+    auto read_tl_locs = [&](uint16_t count) -> std::vector<tlresource_location> {
+        read_align();
+        std::vector<tlresource_location> v(count);
+        if (count > 0) {
+            memcpy(v.data(), &P.raw[pos], count * sizeof(tlresource_location));
+            pos += count * sizeof(tlresource_location);
+        }
+        pos = align_up(pos, 4);
+        return v;
+    };
+    
+    P.parents = read_i32_vec(P.dir.parents.m_size);
+    P.res_locs = read_res_locs(P.dir.resource_locations.m_size);
+    P.textures = read_tl_locs(P.dir.texture_locations.m_size);
+    P.mesh_files = read_tl_locs(P.dir.mesh_file_locations.m_size);
+    P.meshes = read_tl_locs(P.dir.mesh_locations.m_size);
+    P.morph_files = read_tl_locs(P.dir.morph_file_locations.m_size);
+    P.morphs = read_tl_locs(P.dir.morph_locations.m_size);
+    P.material_files = read_tl_locs(P.dir.material_file_locations.m_size);
+    P.materials = read_tl_locs(P.dir.material_locations.m_size);
+    P.anim_files = read_tl_locs(P.dir.anim_file_locations.m_size);
+    P.anims = read_tl_locs(P.dir.anim_locations.m_size);
+    P.scene_anims = read_tl_locs(P.dir.scene_anim_locations.m_size);
+    P.skeletons = read_tl_locs(P.dir.skeleton_locations.m_size);
+    
     return P;
 }
 
-// ---- Export (dump files)
-static void do_export(const fs::path& packPath, const fs::path& outDir) {
-    auto P = parse_pack(packPath);
-    const uint32_t base = P.packHeader.res_dir_mash_size;
+// ==================== Export ====================
 
-    fs::path targetDir = outDir.empty() ? packPath.stem() : outDir;
-    fs::create_directories(targetDir);
-
-    for (size_t i = 0; i < P.resLocs.size(); ++i) {
-        const auto& rl = P.resLocs[i];
-        const uint32_t hash = rl.field_0.m_hash.source_hash_code;
-        const uint32_t type = rl.field_0.m_type;
-
-        uint64_t start = (uint64_t)base + rl.m_offset;
+static void do_export(const fs::path& pack_path, const fs::path& out_dir, const fs::path& dict_path) {
+    load_hash_dictionary(dict_path);
+    
+    printf("Parsing %s...\n", pack_path.string().c_str());
+    ParsedPack P = parse_pcpack(pack_path);
+    
+    printf("PCPACK Info:\n");
+    printf("  Directory offset: 0x%X\n", P.pack_header.directory_offset);
+    printf("  Base (payload start): 0x%X (%u)\n", P.base(), P.base());
+    printf("  Resource locations: %zu\n", P.res_locs.size());
+    printf("  Texture locations: %zu\n", P.textures.size());
+    printf("  Mesh file locations: %zu\n", P.mesh_files.size());
+    printf("  Mesh locations: %zu\n", P.meshes.size());
+    printf("  Material locations: %zu\n", P.materials.size());
+    printf("  Anim file locations: %zu\n", P.anim_files.size());
+    printf("  Anim locations: %zu\n", P.anims.size());
+    printf("  Skeleton locations: %zu\n", P.skeletons.size());
+    
+    fs::path target_dir = out_dir.empty() ? pack_path.stem() : out_dir;
+    fs::create_directories(target_dir);
+    
+    // Export manifest file for reimport
+    fs::path manifest_path = target_dir / "_manifest.txt";
+    std::ofstream manifest(manifest_path);
+    manifest << "# PCPACK Manifest\n";
+    manifest << "# base=" << P.base() << "\n";
+    manifest << "# resources=" << P.res_locs.size() << "\n\n";
+    
+    printf("\nExporting %zu resources to %s\n", P.res_locs.size(), target_dir.string().c_str());
+    
+    for (size_t i = 0; i < P.res_locs.size(); ++i) {
+        const auto& rl = P.res_locs[i];
+        uint32_t hash = rl.field_0.m_hash.source_hash_code;
+        uint32_t type = rl.field_0.m_type;
+        uint64_t start = (uint64_t)P.base() + rl.m_offset;
         uint64_t end = start + rl.m_size;
-        ensure(end <= P.wholeFile.size(), "Payload range out of file bounds");
-
-        std::string fname = platform_name(hash, type);
-        // sanitize filename
-        for (char& c : fname) {
-            if (c < 32 || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
-                c = '_';
+        
+        if (end > P.raw.size()) {
+            printf("  [%zu] WARNING: payload out of bounds (0x%llX > 0x%zX)\n",
+                   i, (unsigned long long)end, P.raw.size());
+            continue;
         }
-
-        fs::path outPath = targetDir / fname;
-        std::ofstream of(outPath, std::ios::binary);
-        if (!of) fail(("Cannot write: " + outPath.string()).c_str());
-        of.write((const char*)&P.wholeFile[(size_t)start], rl.m_size);
+        
+        std::string fname = sanitize_filename(get_filename(hash, type));
+        fs::path out_path = target_dir / fname;
+        
+        std::ofstream of(out_path, std::ios::binary);
+        if (!of) {
+            printf("  [%zu] ERROR: cannot write %s\n", i, fname.c_str());
+            continue;
+        }
+        of.write((const char*)&P.raw[start], rl.m_size);
         of.close();
-
-        std::printf("Exported %s: [0x%08X..0x%08X)\n",
-            fname.c_str(), (uint32_t)start, (uint32_t)end);
+        
+        // Write to manifest: index hash type offset size filename
+        manifest << i << " 0x" << std::hex << hash << " " << std::dec << type
+                 << " 0x" << std::hex << rl.m_offset << " 0x" << rl.m_size
+                 << " " << fname << "\n";
+        
+        printf("  [%zu] %s (0x%X bytes at offset 0x%X)\n",
+               i, fname.c_str(), rl.m_size, rl.m_offset);
     }
-    std::puts("Done.");
+    
+    manifest.close();
+    printf("\nExport complete. Manifest written to %s\n", manifest_path.string().c_str());
 }
 
-static inline size_t align_up_sz(size_t x, size_t a) {
-    if (a == 0 || a == 1) return x;
-    size_t m = x % a;
-    return m ? (x + (a - m)) : x;
-}
-static bool  g_updateDir = false;
-static size_t g_payloadAlign = 1;
+// ==================== Import ====================
 
-
-
-// ---- Import (repack with original structure/offsets)
-
-static void do_import(const fs::path& packPath,
-    const fs::path& inputFolder,
-    const fs::path& outPackPath) {
-    auto P = parse_pack(packPath);
-    const uint32_t base = P.packHeader.res_dir_mash_size;
-
-    fs::path folder = inputFolder.empty() ? packPath.stem() : inputFolder;
-
-    // We will emit into 'out' like before.
+static void do_import(const fs::path& orig_pack, const fs::path& input_dir,
+                      const fs::path& out_pack, size_t align_val) {
+    printf("Parsing original pack %s...\n", orig_pack.string().c_str());
+    ParsedPack P = parse_pcpack(orig_pack);
+    
+    printf("Original PCPACK base: 0x%X\n", P.base());
+    printf("Processing %zu resources...\n", P.res_locs.size());
+    
+    // Build old offset -> resource index mapping for tlresource_location updates
+    std::unordered_map<uint32_t, size_t> old_offset_to_idx;
+    for (size_t i = 0; i < P.res_locs.size(); ++i) {
+        old_offset_to_idx[P.res_locs[i].m_offset] = i;
+    }
+    
+    // Calculate new offsets and sizes
+    struct NewResource {
+        uint32_t new_offset;
+        uint32_t new_size;
+        std::vector<uint8_t> data;
+        bool from_file;
+    };
+    std::vector<NewResource> new_resources(P.res_locs.size());
+    
+    uint32_t cursor = 0;  // offset relative to base
+    for (size_t i = 0; i < P.res_locs.size(); ++i) {
+        const auto& rl = P.res_locs[i];
+        uint32_t hash = rl.field_0.m_hash.source_hash_code;
+        uint32_t type = rl.field_0.m_type;
+        
+        std::string fname = sanitize_filename(get_filename(hash, type));
+        fs::path in_file = input_dir / fname;
+        
+        if (fs::exists(in_file)) {
+            new_resources[i].data = read_file(in_file);
+            new_resources[i].new_size = (uint32_t)new_resources[i].data.size();
+            new_resources[i].from_file = true;
+            printf("  [%zu] %s: from file (%u bytes)\n", i, fname.c_str(), new_resources[i].new_size);
+        } else {
+            // Keep original data
+            uint64_t start = (uint64_t)P.base() + rl.m_offset;
+            new_resources[i].data.resize(rl.m_size);
+            memcpy(new_resources[i].data.data(), &P.raw[start], rl.m_size);
+            new_resources[i].new_size = rl.m_size;
+            new_resources[i].from_file = false;
+            printf("  [%zu] %s: kept original (%u bytes)\n", i, fname.c_str(), rl.m_size);
+        }
+        
+        cursor = (uint32_t)align_up(cursor, align_val);
+        new_resources[i].new_offset = cursor;
+        cursor += new_resources[i].new_size;
+    }
+    
+    // Build offset delta map: old_offset -> new_offset
+    std::unordered_map<uint32_t, uint32_t> offset_map;
+    for (size_t i = 0; i < P.res_locs.size(); ++i) {
+        offset_map[P.res_locs[i].m_offset] = new_resources[i].new_offset;
+    }
+    
+    // For tlresource_locations, find which resource they belong to and compute delta
+    auto update_tl_offset = [&](uint32_t old_off) -> uint32_t {
+        // Find which resource this offset falls within
+        for (size_t i = 0; i < P.res_locs.size(); ++i) {
+            uint32_t res_start = P.res_locs[i].m_offset;
+            uint32_t res_end = res_start + P.res_locs[i].m_size;
+            if (old_off >= res_start && old_off < res_end) {
+                // This tl belongs to resource i
+                uint32_t internal_off = old_off - res_start;
+                return new_resources[i].new_offset + internal_off;
+            }
+        }
+        // No match found - keep original (might be 0 or special value)
+        return old_off;
+    };
+    
+    // Update all tlresource_location offsets
+    auto update_tl_vec = [&](std::vector<tlresource_location>& vec, const char* name) {
+        for (auto& tl : vec) {
+            uint32_t old = tl.offset;
+            tl.offset = update_tl_offset(old);
+            if (old != tl.offset && vec.size() < 20) {
+                printf("    %s: 0x%X -> 0x%X\n", name, old, tl.offset);
+            }
+        }
+    };
+    
+    printf("\nUpdating tlresource_location offsets...\n");
+    update_tl_vec(P.textures, "texture");
+    update_tl_vec(P.mesh_files, "mesh_file");
+    update_tl_vec(P.meshes, "mesh");
+    update_tl_vec(P.morph_files, "morph_file");
+    update_tl_vec(P.morphs, "morph");
+    update_tl_vec(P.material_files, "material_file");
+    update_tl_vec(P.materials, "material");
+    update_tl_vec(P.anim_files, "anim_file");
+    update_tl_vec(P.anims, "anim");
+    update_tl_vec(P.scene_anims, "scene_anim");
+    update_tl_vec(P.skeletons, "skeleton");
+    
+    // Update resource_locations
+    for (size_t i = 0; i < P.res_locs.size(); ++i) {
+        P.res_locs[i].m_offset = new_resources[i].new_offset;
+        P.res_locs[i].m_size = new_resources[i].new_size;
+    }
+    
+    // Now rebuild the entire file
+    printf("\nRebuilding PCPACK...\n");
+    
     std::vector<uint8_t> out;
-    out.resize(sizeof(resource_pack_header), 0);
-    std::memcpy(out.data(), &P.packHeader, sizeof(P.packHeader));
-
-    // Seek to directory_offset and write mash header + directory (possibly with updated base field)
-    if (out.size() < P.packHeader.directory_offset)
-        out.resize(P.packHeader.directory_offset, 0);
-
-    // Make a writable copy of the directory struct (so we can ensure base is set)
-    resource_directory writableDir = P.dir;
-    // Keep base consistent with header (for tooling sanity)
-    writableDir.base = (int32_t)base;
-
-    // mash header
-    out.insert(out.end(),
-        (const uint8_t*)&P.mashHeader,
-        (const uint8_t*)&P.mashHeader + sizeof(P.mashHeader));
-
-    // directory blob (will point to arrays we emit next)
-    out.insert(out.end(),
-        (const uint8_t*)&writableDir,
-        (const uint8_t*)&writableDir + sizeof(writableDir));
-
-    // Re-emit vector payload area (same as before)
-    auto emit_align = [&](size_t i) { write_align_with(0xE3, out, i); };
-
-    emit_align(8);
-    emit_align(4);
-
-    // parents: as before, write a single u32 zero if present count > 0 (we don't rely on its content)
-    if (writableDir.parents.m_size > 0) {
-        uint32_t zero = 0;
-        out.insert(out.end(), (uint8_t*)&zero, (uint8_t*)&zero + sizeof(uint32_t));
-    }
-    emit_align(4);
-
-    // If we're updating directory, we’ll mutate a working copy of resLocs with new offsets/sizes.
-    std::vector<resource_location> workingResLocs = P.resLocs;
-
-    // When --update-dir is enabled, determine new offsets/sizes from files:
-    // We *do not* write payloads here yet—just compute metadata; we’ll write payloads after all vectors are serialized.
-    std::vector<size_t> newStarts(workingResLocs.size(), 0);
-    std::vector<size_t> newSizes(workingResLocs.size(), 0);
-
-    if (g_updateDir) {
-        size_t cursor = base; // absolute file offset where payload area starts
-        for (size_t i = 0; i < workingResLocs.size(); ++i) {
-            const auto& rl = workingResLocs[i];
-            const std::string fname = platform_name(rl.field_0.m_hash.source_hash_code, rl.field_0.m_type);
-            fs::path inFile = folder / fname;
-
-            size_t payloadSize = (size_t)rl.m_size; // default to original
-            if (fs::exists(inFile)) {
-                payloadSize = (size_t)fs::file_size(inFile);
-            }
-            else {
-                // fall back to original size if replacement missing
-                std::fprintf(stderr, "Missing file, will keep original bytes: %s\n", inFile.string().c_str());
-            }
-
-            // Align cursor to requested boundary (if any)
-            cursor = align_up_sz(cursor, g_payloadAlign);
-
-            newStarts[i] = cursor;     // absolute file offset
-            newSizes[i] = payloadSize;
-
-            // advance
-            cursor += payloadSize;
-        }
-
-        // Now patch resource_location entries (offset is relative to base)
-        for (size_t i = 0; i < workingResLocs.size(); ++i) {
-            workingResLocs[i].m_offset = (uint32_t)(newStarts[i] - base);
-            workingResLocs[i].m_size = (uint32_t)newSizes[i];
-        }
-    }
-
-    // Helper to write arrays for each vector
-    auto emit_vec_bytes = [&](const void* data, size_t elemSize, size_t count) {
-        emit_align(8);
-        emit_align(4);
-        if (count) {
-            const uint8_t* p = (const uint8_t*)data;
-            out.insert(out.end(), p, p + elemSize * count);
+    
+    // Write pack header (unchanged except we'll verify base stays same)
+    out.resize(sizeof(resource_pack_header));
+    memcpy(out.data(), &P.pack_header, sizeof(P.pack_header));
+    
+    // Pad to directory offset
+    if (out.size() < P.pack_header.directory_offset)
+        out.resize(P.pack_header.directory_offset, 0);
+    
+    // Write mash header
+    out.insert(out.end(), (uint8_t*)&P.mash_header, (uint8_t*)&P.mash_header + sizeof(P.mash_header));
+    
+    // Write directory
+    out.insert(out.end(), (uint8_t*)&P.dir, (uint8_t*)&P.dir + sizeof(P.dir));
+    
+    // Helper to write vectors with alignment
+    auto emit_align = [&](size_t a, uint8_t fill = 0xE3) {
+        size_t want = align_up(out.size(), a);
+        if (want > out.size()) out.insert(out.end(), want - out.size(), fill);
+    };
+    
+    auto emit_i32_vec = [&](const std::vector<int32_t>& v) {
+        emit_align(8); emit_align(4);
+        if (!v.empty()) {
+            const uint8_t* p = (const uint8_t*)v.data();
+            out.insert(out.end(), p, p + v.size() * sizeof(int32_t));
         }
         emit_align(4);
-        };
-
-    // IMPORTANT: emit resource_locations from the *working* vector (patched if --update-dir)
-    if (!workingResLocs.empty()) {
-        emit_vec_bytes(workingResLocs.data(), sizeof(resource_location), workingResLocs.size());
-    }
-    else {
-        emit_align(8); emit_align(4); emit_align(4);
-    }
-
-    // The rest TL vectors are unchanged
-    auto emit_tl = [&](const std::vector<tlresource_location>& v) {
-        if (!v.empty()) emit_vec_bytes(v.data(), sizeof(tlresource_location), v.size());
-        else { emit_align(8); emit_align(4); emit_align(4); }
-        };
-
-    emit_tl(P.textures);
-    emit_tl(P.mesh_files);
-    emit_tl(P.meshes);
-    emit_tl(P.morph_files);
-    emit_tl(P.morphs);
-    emit_tl(P.material_files);
-    emit_tl(P.materials);
-    emit_tl(P.anim_files);
-    emit_tl(P.anims);
-    emit_tl(P.scene_anims);
-    emit_tl(P.skeletons);
-
-    // Ensure capacity up to end of last payload we will write
-    size_t fileEndTarget = out.size();
-
-    // Write payloads:
-    // - If --update-dir: write at newStarts[i] (aligned), using file size or original content if missing.
-    // - Else (legacy): keep original positions/sizes like before.
-    if (g_updateDir) {
-        for (size_t i = 0; i < workingResLocs.size(); ++i) {
-            const auto& rlNew = workingResLocs[i];
-            size_t start = (size_t)base + (size_t)rlNew.m_offset;  // absolute
-            size_t size = (size_t)rlNew.m_size;
-
-            // grow buffer
-            if (out.size() < start) out.resize(start, 0x00);
-            if (out.size() < start + size) out.resize(start + size, 0x00);
-
-            const auto& rlOld = P.resLocs[i];
-            const std::string fname = platform_name(rlOld.field_0.m_hash.source_hash_code, rlOld.field_0.m_type);
-            fs::path inFile = folder / fname;
-
-            if (fs::exists(inFile)) {
-                auto data = read_file_bin(inFile);
-                // clip/pad to size if needed (size equals file size by construction)
-                std::memcpy(&out[start], data.data(), std::min<size_t>(data.size(), size));
-                if (data.size() < size) {
-                    std::memset(&out[start + data.size()], 0, size - data.size());
-                }
-            }
-            else {
-                // write original bytes from original position/size (may be smaller/larger than rlNew.m_size)
-                size_t oldStart = (size_t)base + (size_t)rlOld.m_offset;
-                size_t copyN = std::min<size_t>(size, (size_t)rlOld.m_size);
-                std::memcpy(&out[start], &P.wholeFile[oldStart], copyN);
-                if (size > copyN) {
-                    std::memset(&out[start + copyN], 0, size - copyN);
-                }
-            }
-
-            fileEndTarget = std::max(fileEndTarget, start + size);
-            std::printf("Repacked payload -> [%#010zx .. %#010zx)\n", start, start + size);
+    };
+    
+    auto emit_res_vec = [&](const std::vector<resource_location>& v) {
+        emit_align(8); emit_align(4);
+        if (!v.empty()) {
+            const uint8_t* p = (const uint8_t*)v.data();
+            out.insert(out.end(), p, p + v.size() * sizeof(resource_location));
         }
-    }
-    else {
-        // Legacy path (unchanged): keep original positions/sizes
-        if (out.size() < P.wholeFile.size()) out.resize(P.wholeFile.size(), 0);
-        for (const auto& rl : P.resLocs) {
-            size_t start = (size_t)base + (size_t)rl.m_offset;
-            size_t end = start + (size_t)rl.m_size;
-            ensure(end <= out.size(), "Payload range out of bounds in output");
-
-            std::string fname = platform_name(rl.field_0.m_hash.source_hash_code, rl.field_0.m_type);
-            fs::path inFile = folder / fname;
-
-            if (fs::exists(inFile)) {
-                auto data = read_file_bin(inFile);
-                size_t n = std::min<size_t>(data.size(), rl.m_size);
-                std::memcpy(&out[start], data.data(), n);
-                if (rl.m_size > n) std::memset(&out[start + n], 0, rl.m_size - n);
-            }
-            else {
-                std::memcpy(&out[start], &P.wholeFile[start], rl.m_size);
-                std::fprintf(stderr, "Missing file, kept original bytes: %s\n", inFile.string().c_str());
-            }
-            std::printf("Wrote payload at [0x%08zX..0x%08zX)\n", start, end);
+        emit_align(4);
+    };
+    
+    auto emit_tl_vec = [&](const std::vector<tlresource_location>& v) {
+        emit_align(8); emit_align(4);
+        if (!v.empty()) {
+            const uint8_t* p = (const uint8_t*)v.data();
+            out.insert(out.end(), p, p + v.size() * sizeof(tlresource_location));
         }
-        fileEndTarget = std::max(fileEndTarget, out.size());
+        emit_align(4);
+    };
+    
+    emit_i32_vec(P.parents);
+    emit_res_vec(P.res_locs);
+    emit_tl_vec(P.textures);
+    emit_tl_vec(P.mesh_files);
+    emit_tl_vec(P.meshes);
+    emit_tl_vec(P.morph_files);
+    emit_tl_vec(P.morphs);
+    emit_tl_vec(P.material_files);
+    emit_tl_vec(P.materials);
+    emit_tl_vec(P.anim_files);
+    emit_tl_vec(P.anims);
+    emit_tl_vec(P.scene_anims);
+    emit_tl_vec(P.skeletons);
+    
+    // Pad to base offset
+    if (out.size() < P.base()) {
+        out.resize(P.base(), 0xE3);
     }
-
-    // Trim/extend final size to exactly fileEndTarget (no need to keep original size now)
-    if (out.size() < fileEndTarget) out.resize(fileEndTarget, 0x00);
-
-    // Output filename
-    fs::path outPath;
-    if (outPackPath.empty()) {
-        // Same directory as input, filename = <stem>._PCPACK
-        outPath = packPath.parent_path() / (packPath.stem().string() + "._PCPACK");
+    
+    printf("Header area ends at 0x%zX, base is 0x%X\n", out.size(), P.base());
+    
+    // Write payload data
+    for (size_t i = 0; i < new_resources.size(); ++i) {
+        const auto& nr = new_resources[i];
+        size_t start = (size_t)P.base() + nr.new_offset;
+        
+        // Ensure output is large enough
+        if (out.size() < start + nr.new_size) {
+            out.resize(start + nr.new_size, 0);
+        }
+        
+        memcpy(&out[start], nr.data.data(), nr.new_size);
     }
-    else {
-        outPath = outPackPath;
-    }
-
-    // (optional) ensure parent exists
-    if (!outPath.parent_path().empty())
-        fs::create_directories(outPath.parent_path());
-
-
-    write_file_bin(outPath, out);
-    std::printf("Done. Wrote: %s (size: %zu bytes)\n", outPath.string().c_str(), out.size());
+    
+    // Write output
+    fs::path out_path = out_pack.empty() ?
+        (orig_pack.parent_path() / (orig_pack.stem().string() + ".NEW.PCPACK")) : out_pack;
+    
+    if (!out_path.parent_path().empty())
+        fs::create_directories(out_path.parent_path());
+    
+    write_file(out_path, out);
+    
+    printf("\nImport complete!\n");
+    printf("  Output: %s\n", out_path.string().c_str());
+    printf("  Size: %zu bytes (0x%zX)\n", out.size(), out.size());
 }
 
-// pcpacks_extract.cpp — C++17 single-file PCPACK extractor
-// Usage: pcpacks_extract <pack.bin> [--out outdir] [--flat] [--dataoff 0x...]
-// Finds 2nd 0xE3E3E3E3, parses directory (name_hash,type,rel_off,size), dumps payloads.
+// ==================== Main ====================
 
-using namespace std;
-
-static const uint32_t SENT = 0xE3E3E3E3;
-
-struct DirEntry { uint32_t name_hash, type, rel_off, size; };
-
-static uint32_t rd32LE(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
-
-
-
-// -------- CLI
-static void print_help() {
-    std::puts(
-        R"(pcpack_tool — Ultimate Spider-Man PCPACK importer/exporter
-
-Usage:
-  pcpack_tool export <file.PCPACK> [--dict string_hash_dictionary.txt] [--outdir <dir>]
-  pcpack_tool import <file.PCPACK> [--dict string_hash_dictionary.txt] [--in <dir>] [--out <file.PCPACK>]
-
-Notes:
-- Export dumps all resource payloads into the folder <file> (or --outdir).
-- Import reads files from the folder (default <file>), writes a new pack preserving the directory/vectors and original size.
-- If a file is missing during import, the original bytes are kept for that resource.
-)");
+static void print_usage() {
+    printf("PCPACK Tool - Ultimate Spider-Man (2005) PC\n\n");
+    printf("Usage:\n");
+    printf("  pcpack_tool export <input.pcpack> [output_dir] [dictionary.txt]\n");
+    printf("  pcpack_tool import <original.pcpack> <input_dir> <output.pcpack> [--align N]\n");
+    printf("\nExport extracts all resources and creates a manifest file.\n");
+    printf("Import rebuilds the PCPACK using files from input_dir, updating all offsets.\n");
+    printf("\nOptions:\n");
+    printf("  --align N   Align payloads to N bytes (default: 16)\n");
 }
 
 int main(int argc, char** argv) {
     try {
-        if (argc < 3) { print_help(); return 0; }
-        std::string cmd = argv[1];
-        fs::path pack = argv[2];
-
-        fs::path dictPath, inDir, outDir, outPack;
-        for (int i = 3; i < argc; ++i) {
-            std::string a = argv[i];
-            if (a == "--dict" && i + 1 < argc) dictPath = argv[++i];
-            else if (a == "--in" && i + 1 < argc) inDir = argv[++i];
-            else if (a == "--outdir" && i + 1 < argc) outDir = argv[++i];
-            else if (a == "--out" && i + 1 < argc) outPack = argv[++i];
-            else if (a == "--update-dir") g_updateDir = true;
-            else if (a == "--payload-align" && i + 1 < argc) g_payloadAlign = (size_t)std::stoul(argv[++i]);
+        if (argc < 3) {
+            print_usage();
+            return 1;
         }
-
-        if (!dictPath.empty()) load_hash_dictionary(dictPath);
-
+        
+        std::string cmd = argv[1];
+        
         if (cmd == "export") {
-            do_export(pack, outDir);
+            fs::path pack_path = argv[2];
+            fs::path out_dir = (argc > 3) ? argv[3] : "";
+            fs::path dict_path = (argc > 4) ? argv[4] : "";
+            do_export(pack_path, out_dir, dict_path);
         }
         else if (cmd == "import") {
-            do_import(pack, inDir, outPack);
+            if (argc < 5) {
+                print_usage();
+                return 1;
+            }
+            fs::path orig_pack = argv[2];
+            fs::path input_dir = argv[3];
+            fs::path out_pack = argv[4];
+            
+            size_t align_val = 16;
+            for (int i = 5; i < argc - 1; ++i) {
+                if (std::string(argv[i]) == "--align") {
+                    align_val = std::stoul(argv[i + 1]);
+                }
+            }
+            
+            do_import(orig_pack, input_dir, out_pack, align_val);
         }
         else {
-            print_help();
+            print_usage();
+            return 1;
         }
+        
+        return 0;
     }
     catch (const std::exception& e) {
-        std::fprintf(stderr, "Error: %s\n", e.what());
+        fprintf(stderr, "Error: %s\n", e.what());
         return 1;
     }
-    return 0;
 }
