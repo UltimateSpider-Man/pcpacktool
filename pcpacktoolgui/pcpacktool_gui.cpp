@@ -69,7 +69,7 @@ struct resource_pack_header {
     resource_versions field_0;
     uint32_t          field_14;
     uint32_t          directory_offset;
-    uint32_t          res_dir_mash_size;
+    uint32_t          res_dir_mash_size; // base for payload
     uint32_t          field_20;
     uint32_t          field_24;
     uint32_t          field_28;
@@ -176,22 +176,41 @@ static COLORREF get_type_color(const char* ext) {
 //  Helpers
 // ============================================================================
 
-static std::unordered_map<uint32_t, std::string> g_hashDict;
+static std::unordered_map<uint32_t, std::string> g_hashDict;      // hash -> name
+static std::unordered_map<std::string, uint32_t> g_nameToHash;    // name -> hash (reverse)
+
+static std::string to_upper(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::toupper(c); });
+    return s;
+}
+static std::string to_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+    return s;
+}
 
 static void load_hash_dictionary(const fs::path& path) {
     if (path.empty() || !fs::exists(path)) return;
     g_hashDict.clear();
+    g_nameToHash.clear();
+
     std::ifstream f(path);
     if (!f) return;
+
     std::string line;
     while (std::getline(f, line)) {
         if (line.empty()) continue;
         std::istringstream iss(line);
         std::string hex_str, name;
         if (!(iss >> hex_str >> name)) continue;
+
         if (hex_str.size() >= 2 && hex_str[0] == '0' && (hex_str[1] == 'x' || hex_str[1] == 'X')) {
             uint32_t v = (uint32_t)std::stoul(hex_str, nullptr, 16);
             g_hashDict[v] = name;
+
+            // reverse lookup (case-insensitive)
+            g_nameToHash[name] = v;
+            std::string lower = to_lower(name);
+            g_nameToHash[lower] = v;
         }
     }
 }
@@ -249,6 +268,66 @@ static std::string format_size(uint64_t bytes) {
 static std::string format_hex(uint32_t v) {
     char buf[16]; snprintf(buf, sizeof(buf), "0x%08X", v);
     return buf;
+}
+
+static int type_from_ext_ci(const std::string& ext) {
+    std::string u = to_upper(ext);
+    for (int i = 0; i < NUM_RESOURCE_TYPES; ++i) {
+        std::string te = resource_type_ext[i] ? resource_type_ext[i] : "";
+        if (to_upper(te) == u) return i;
+    }
+    return -1;
+}
+
+struct ParsedName {
+    bool ok = false;
+    uint32_t hash = 0;
+    uint32_t type = 0;
+};
+
+static ParsedName parse_folder_filename(const fs::path& p) {
+    ParsedName r;
+    std::string ext = p.extension().string();
+    int t = type_from_ext_ci(ext);
+    if (t < 0) return r;
+
+    std::string stem = p.stem().string();
+
+    // allow "0x12345678"
+    if (stem.size() >= 2 && stem[0] == '0' && (stem[1] == 'x' || stem[1] == 'X')) {
+        try {
+            r.hash = (uint32_t)std::stoul(stem, nullptr, 16);
+            r.type = (uint32_t)t;
+            r.ok = true;
+            return r;
+        } catch (...) {
+            return r;
+        }
+    }
+
+    // dictionary name -> hash (case-insensitive)
+    {
+        auto it = g_nameToHash.find(stem);
+        if (it != g_nameToHash.end()) {
+            r.hash = it->second;
+            r.type = (uint32_t)t;
+            r.ok = true;
+            return r;
+        }
+        std::string lower = to_lower(stem);
+        it = g_nameToHash.find(lower);
+        if (it != g_nameToHash.end()) {
+            r.hash = it->second;
+            r.type = (uint32_t)t;
+            r.ok = true;
+            return r;
+        }
+    }
+    return r;
+}
+
+static uint64_t make_key(uint32_t hash, uint32_t type) {
+    return (uint64_t(type) << 32) | uint64_t(hash);
 }
 
 // ============================================================================
@@ -382,7 +461,7 @@ static void do_export_single(const ParsedPack& P, int index, const fs::path& out
 }
 
 // ============================================================================
-//  Import / Rebuild
+//  Import / Rebuild (replace existing by index)
 // ============================================================================
 
 static std::vector<uint8_t> do_import(
@@ -470,8 +549,348 @@ static std::vector<uint8_t> do_import(
     for (size_t i = 0; i < nres.size(); ++i) {
         size_t s = (size_t)P.base() + nres[i].new_offset;
         if (out.size() < s + nres[i].new_size) out.resize(s + nres[i].new_size, 0);
-        memcpy(&out[s], nres[i].data.data(), nres[i].new_size);
+        if (nres[i].new_size)
+            memcpy(&out[s], nres[i].data.data(), nres[i].new_size);
     }
+    return out;
+}
+
+// ============================================================================
+//  Reimport (Folder Sync + Add New + Reorder by type then hash)
+// ============================================================================
+//  Reimport (Folder Sync + Add New + Reorder by type then hash)
+//   - NEW: also adds TL entries for newly added resources (when applicable)
+//   - NEW: patches pack header res_dir_mash_size (+ directory_offset safety)
+// ============================================================================
+
+static std::vector<uint8_t> do_reimport_from_folder(
+    ParsedPack& P,
+    const fs::path& folder,
+    size_t align_val,
+    std::string* out_log)
+{
+    if (!fs::exists(folder) || !fs::is_directory(folder))
+        throw std::runtime_error("Reimport folder does not exist or is not a directory.");
+
+    struct OldRes { uint32_t old_off, old_size; };
+    std::vector<OldRes> old(P.res_locs.size());
+    for (size_t i = 0; i < P.res_locs.size(); ++i) {
+        old[i].old_off = P.res_locs[i].m_offset;
+        old[i].old_size = P.res_locs[i].m_size;
+    }
+
+    std::unordered_map<uint64_t, int> key_to_index;
+    key_to_index.reserve(P.res_locs.size() * 2);
+    for (size_t i = 0; i < P.res_locs.size(); ++i) {
+        uint32_t h = P.res_locs[i].field_0.m_hash.source_hash_code;
+        uint32_t t = P.res_locs[i].field_0.m_type;
+        key_to_index[make_key(h, t)] = (int)i;
+    }
+
+    struct Item {
+        uint32_t hash = 0;
+        uint32_t type = 0;
+        std::vector<uint8_t> data;
+        bool has_old = false;
+        uint32_t old_off = 0;
+        uint32_t old_size = 0;
+    };
+
+    std::vector<Item> items;
+    items.reserve(P.res_locs.size() + 256);
+
+    // Seed from old pack (keeps old_off/old_size for TL remap)
+    for (size_t i = 0; i < P.res_locs.size(); ++i) {
+        Item it;
+        it.hash = P.res_locs[i].field_0.m_hash.source_hash_code;
+        it.type = P.res_locs[i].field_0.m_type;
+        it.has_old = true;
+        it.old_off = old[i].old_off;
+        it.old_size = old[i].old_size;
+
+        uint64_t s = (uint64_t)P.base() + old[i].old_off;
+        uint64_t e = s + old[i].old_size;
+        if (e > P.raw.size()) throw std::runtime_error("Corrupted pack: resource out of bounds.");
+        it.data.assign(&P.raw[s], &P.raw[s] + old[i].old_size);
+        items.push_back(std::move(it));
+    }
+
+    auto log_append = [&](const std::string& s) {
+        if (out_log) { *out_log += s; *out_log += "\r\n"; }
+        };
+
+    int updated = 0, added = 0, skipped = 0;
+
+    // Apply folder changes (update existing, add new)
+    for (auto& de : fs::directory_iterator(folder)) {
+        if (!de.is_regular_file()) continue;
+
+        ParsedName pn = parse_folder_filename(de.path());
+        if (!pn.ok) { skipped++; continue; }
+
+        std::vector<uint8_t> fileData;
+        try { fileData = read_file(de.path()); }
+        catch (...) { skipped++; continue; }
+
+        uint64_t key = make_key(pn.hash, pn.type);
+        auto itIdx = key_to_index.find(key);
+        if (itIdx != key_to_index.end()) {
+            int idx = itIdx->second;
+            if (idx >= 0 && idx < (int)items.size()) {
+                items[idx].data = std::move(fileData);
+                updated++;
+            }
+            else {
+                skipped++;
+            }
+        }
+        else {
+            Item ni;
+            ni.hash = pn.hash;
+            ni.type = pn.type;
+            ni.data = std::move(fileData);
+            ni.has_old = false;
+            items.push_back(std::move(ni));
+            key_to_index[key] = (int)items.size() - 1;
+            added++;
+        }
+    }
+
+    log_append("Reimport folder: " + folder.string());
+    log_append("Updated: " + std::to_string(updated) + ", Added: " + std::to_string(added) + ", Skipped: " + std::to_string(skipped));
+
+    // Sort by type then hash
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        if (a.type != b.type) return a.type < b.type;
+        return a.hash < b.hash;
+        });
+
+    // Rebuild resource_locations
+    P.res_locs.clear();
+    P.res_locs.resize(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        P.res_locs[i].field_0.m_hash.source_hash_code = items[i].hash;
+        P.res_locs[i].field_0.m_type = items[i].type;
+        P.res_locs[i].m_offset = 0;
+        P.res_locs[i].m_size = (uint32_t)items[i].data.size();
+    }
+
+    // Update dir counts + type ranges
+    P.dir.resource_locations.m_size = (uint16_t)P.res_locs.size();
+    for (int t = 0; t < 70; ++t) {
+        P.dir.type_start_idxs[t] = 0;
+        P.dir.type_end_idxs[t] = 0; // COUNT
+    }
+    for (size_t i = 0; i < P.res_locs.size(); ++i) {
+        uint32_t t = P.res_locs[i].field_0.m_type;
+        if (t >= 70) continue;
+
+        if (P.dir.type_end_idxs[t] == 0)
+            P.dir.type_start_idxs[t] = (int32_t)i;
+
+        P.dir.type_end_idxs[t] += 1;
+    }
+
+    // Assign new offsets in payload
+    uint32_t cursor = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+        cursor = (uint32_t)align_up(cursor, align_val);
+        P.res_locs[i].m_offset = cursor;
+        cursor += (uint32_t)items[i].data.size();
+    }
+
+    // ------------------------------------------------------------------------
+    // NEW: Add TL entries for any newly added resources (if they belong to TL sets)
+    // ------------------------------------------------------------------------
+    auto tl_has = [](const std::vector<tlresource_location>& v, uint32_t h, uint8_t t8) {
+        for (auto& x : v) {
+            if (x.name.source_hash_code == h && x.type == t8) return true;
+        }
+        return false;
+        };
+
+    // Map resource type -> TL vector to update
+    auto tl_vector_for_type = [&](uint32_t rtype) -> std::vector<tlresource_location>*{
+        const char* ext = get_ext(rtype);
+
+        // Pragmatic mapping used by USM packs:
+        if (!strcmp(ext, ".DDS") || !strcmp(ext, ".DDSMP")) return &P.textures;
+
+        if (!strcmp(ext, ".PCMESHDEF")) return &P.mesh_files;
+        if (!strcmp(ext, ".PCMESH"))    return &P.meshes;
+
+        if (!strcmp(ext, ".PCMORPHDEF")) return &P.morph_files;
+        if (!strcmp(ext, ".PCMORPH"))    return &P.morphs;
+
+        if (!strcmp(ext, ".PCMATDEF")) return &P.material_files;
+        if (!strcmp(ext, ".PCMAT"))    return &P.materials;
+
+        if (!strcmp(ext, ".PCANIM"))  return &P.anims;
+        if (!strcmp(ext, ".PCSANIM")) return &P.scene_anims;
+
+        if (!strcmp(ext, ".PCSKEL")) return &P.skeletons;
+
+        return nullptr;
+        };
+
+    // Add TL for new items ONLY
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (items[i].has_old) continue;
+
+        auto* vec = tl_vector_for_type(items[i].type);
+        if (!vec) continue;
+
+        // tlresource_location.type is uint8; in most packs it's the resource type index (truncated).
+        uint8_t t8 = (uint8_t)items[i].type;
+
+        if (tl_has(*vec, items[i].hash, t8))
+            continue;
+
+        tlresource_location tl{};
+        tl.name.source_hash_code = items[i].hash;
+        tl.type = t8;
+        tl.offset = P.res_locs[i].m_offset; // offsets are relative to base/payload
+        vec->push_back(tl);
+    }
+
+    // Keep TL vectors sorted (nice + stable for tools)
+    auto tl_sort = [](std::vector<tlresource_location>& v) {
+        std::sort(v.begin(), v.end(), [](const tlresource_location& a, const tlresource_location& b) {
+            if (a.type != b.type) return a.type < b.type;
+            return a.name.source_hash_code < b.name.source_hash_code;
+            });
+        };
+    tl_sort(P.textures); tl_sort(P.mesh_files); tl_sort(P.meshes);
+    tl_sort(P.morph_files); tl_sort(P.morphs);
+    tl_sort(P.material_files); tl_sort(P.materials);
+    tl_sort(P.anim_files); tl_sort(P.anims);
+    tl_sort(P.scene_anims); tl_sort(P.skeletons);
+
+    // Update TL counts in directory
+    P.dir.texture_locations.m_size = (uint16_t)P.textures.size();
+    P.dir.mesh_file_locations.m_size = (uint16_t)P.mesh_files.size();
+    P.dir.mesh_locations.m_size = (uint16_t)P.meshes.size();
+    P.dir.morph_file_locations.m_size = (uint16_t)P.morph_files.size();
+    P.dir.morph_locations.m_size = (uint16_t)P.morphs.size();
+    P.dir.material_file_locations.m_size = (uint16_t)P.material_files.size();
+    P.dir.material_locations.m_size = (uint16_t)P.materials.size();
+    P.dir.anim_file_locations.m_size = (uint16_t)P.anim_files.size();
+    P.dir.anim_locations.m_size = (uint16_t)P.anims.size();
+    P.dir.scene_anim_locations.m_size = (uint16_t)P.scene_anims.size();
+    P.dir.skeleton_locations.m_size = (uint16_t)P.skeletons.size();
+
+    // ------------------------------------------------------------------------
+    // Remap OLD TL offsets -> NEW (only for existing ones). Newly added TL entries
+    // already point at new offsets.
+    // ------------------------------------------------------------------------
+    auto old_to_new = [&](uint32_t old_off) -> uint32_t {
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (!items[i].has_old) continue;
+            uint32_t rs = items[i].old_off;
+            uint32_t re = rs + items[i].old_size;
+            if (old_off >= rs && old_off < re) {
+                uint32_t h = items[i].hash, t = items[i].type;
+                for (size_t j = 0; j < P.res_locs.size(); ++j) {
+                    if (P.res_locs[j].field_0.m_hash.source_hash_code == h &&
+                        P.res_locs[j].field_0.m_type == t) {
+                        return P.res_locs[j].m_offset + (old_off - rs);
+                    }
+                }
+                return old_off;
+            }
+        }
+        return old_off;
+        };
+
+    auto remap_tl = [&](std::vector<tlresource_location>& v) {
+        for (auto& t : v) {
+            // If this TL points inside an old resource, remap.
+            // If it's new, it won't match any old containment and will remain unchanged.
+            t.offset = old_to_new(t.offset);
+        }
+        };
+    remap_tl(P.textures); remap_tl(P.mesh_files); remap_tl(P.meshes);
+    remap_tl(P.morph_files); remap_tl(P.morphs);
+    remap_tl(P.material_files); remap_tl(P.materials);
+    remap_tl(P.anim_files); remap_tl(P.anims);
+    remap_tl(P.scene_anims); remap_tl(P.skeletons);
+
+    // ------------------------------------------------------------------------
+    // Serialize directory (can grow) -> recompute base/res_dir_mash_size
+    // ------------------------------------------------------------------------
+    std::vector<uint8_t> out;
+    out.resize(sizeof(resource_pack_header), 0);
+
+    resource_pack_header hdr = P.pack_header;
+
+    // safety: directory_offset must be >= header size
+    if (hdr.directory_offset < sizeof(resource_pack_header))
+        hdr.directory_offset = (uint32_t)sizeof(resource_pack_header);
+
+    if (out.size() < hdr.directory_offset)
+        out.resize(hdr.directory_offset, 0);
+
+    out.insert(out.end(), (uint8_t*)&P.mash_header, (uint8_t*)&P.mash_header + sizeof(P.mash_header));
+    out.insert(out.end(), (uint8_t*)&P.dir, (uint8_t*)&P.dir + sizeof(P.dir));
+
+    auto ea = [&](size_t a, uint8_t f = 0xE3) {
+        size_t w = align_up(out.size(), a);
+        if (w > out.size()) out.insert(out.end(), w - out.size(), f);
+        };
+    auto ei = [&](const std::vector<int32_t>& v) {
+        ea(8); ea(4);
+        if (!v.empty()) {
+            auto* p = (const uint8_t*)v.data();
+            out.insert(out.end(), p, p + v.size() * 4);
+        }
+        ea(4);
+        };
+    auto er = [&](const std::vector<resource_location>& v) {
+        ea(8); ea(4);
+        if (!v.empty()) {
+            auto* p = (const uint8_t*)v.data();
+            out.insert(out.end(), p, p + v.size() * sizeof(resource_location));
+        }
+        ea(4);
+        };
+    auto et = [&](const std::vector<tlresource_location>& v) {
+        ea(8); ea(4);
+        if (!v.empty()) {
+            auto* p = (const uint8_t*)v.data();
+            out.insert(out.end(), p, p + v.size() * sizeof(tlresource_location));
+        }
+        ea(4);
+        };
+
+    ei(P.parents);
+    er(P.res_locs);
+    et(P.textures); et(P.mesh_files); et(P.meshes);
+    et(P.morph_files); et(P.morphs);
+    et(P.material_files); et(P.materials);
+    et(P.anim_files); et(P.anims);
+    et(P.scene_anims); et(P.skeletons);
+
+    uint32_t new_base = (uint32_t)align_up(out.size(), 16);
+    if (out.size() < new_base) out.resize(new_base, 0xE3);
+
+    // ------------------------------------------------------------------------
+    // NEW: Patch header/base fields consistently
+    // ------------------------------------------------------------------------
+    hdr.res_dir_mash_size = new_base;  // payload base
+    P.pack_header.res_dir_mash_size = new_base;
+    P.dir.base = (int32_t)new_base;
+
+    // Payload
+    for (size_t i = 0; i < items.size(); ++i) {
+        size_t s = (size_t)new_base + P.res_locs[i].m_offset;
+        size_t need = s + items[i].data.size();
+        if (out.size() < need) out.resize(need, 0);
+        if (!items[i].data.empty())
+            memcpy(&out[s], items[i].data.data(), items[i].data.size());
+    }
+
+    // Patch header at file start (updated base)
+    memcpy(out.data(), &hdr, sizeof(hdr));
     return out;
 }
 
@@ -492,7 +911,7 @@ struct App {
     std::unique_ptr<ParsedPack> pack;
     bool pack_loaded = false;
 
-    // Replacements
+    // Replacements (index-based build)
     std::unordered_map<int, std::vector<uint8_t>> replacements;
     int align_val = 16;
 
@@ -557,7 +976,6 @@ struct App {
             return asc ? cmp < 0 : cmp > 0;
         });
 
-        // Update ListView
         ListView_SetItemCountEx(hList, (int)filtered.size(), LVSICF_NOSCROLL);
     }
 
@@ -615,7 +1033,7 @@ struct App {
         s += "Skeletons:      " + std::to_string(P.dir.skeleton_locations.m_size) + "\r\n";
         s += "\r\n=== DIRECTORY META ===\r\n";
         s += "pack_slot:  " + std::to_string(P.dir.pack_slot) + "\r\n";
-        s += "base:       " + format_hex(P.dir.base) + "\r\n";
+        s += "base:       " + format_hex((uint32_t)P.dir.base) + "\r\n";
         s += "field_80:   " + format_hex(P.dir.field_80) + "\r\n";
         s += "field_84:   " + format_hex(P.dir.field_84) + "\r\n";
         s += "field_88:   " + format_hex(P.dir.field_88) + "\r\n";
@@ -638,6 +1056,7 @@ enum {
     IDM_IMPORT_FILES,
     IDM_IMPORT_FOLDER,
     IDM_IMPORT_BUILD,
+    IDM_IMPORT_REIMPORT_BUILD, // NEW
     IDM_IMPORT_CLEAR,
     IDM_CTX_EXPORT,
     IDM_CTX_REPLACE,
@@ -664,14 +1083,6 @@ static std::string open_file_dialog(HWND parent, const char* filter, const char*
     ofn.lpstrTitle = title;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
     return GetOpenFileNameA(&ofn) ? path : "";
-}
-
-static std::string open_multi_file_dialog(HWND parent, const char* filter, const char* title, std::vector<std::string>& out) {
-    // Use single file for simplicity; folder import handles batch
-    out.clear();
-    std::string p = open_file_dialog(parent, filter, title);
-    if (!p.empty()) out.push_back(p);
-    return p;
 }
 
 static std::string save_file_dialog(HWND parent, const char* filter, const char* title, const char* defext) {
@@ -761,7 +1172,6 @@ static void action_export_selected(HWND hwnd) {
     int sel = ListView_GetNextItem(g_app.hList, -1, LVNI_SELECTED);
     if (sel < 0) return;
 
-    // Count selected
     std::vector<int> sels;
     while (sel >= 0) {
         if (sel < (int)g_app.filtered.size()) sels.push_back(g_app.filtered[sel]);
@@ -827,6 +1237,8 @@ static void action_import_folder(HWND hwnd) {
     ListView_RedrawItems(g_app.hList, 0, (int)g_app.filtered.size() - 1);
 }
 
+
+
 static void action_build(HWND hwnd) {
     if (!g_app.pack_loaded || g_app.replacements.empty()) return;
     std::string path = save_file_dialog(hwnd,
@@ -835,7 +1247,7 @@ static void action_build(HWND hwnd) {
     if (path.empty()) return;
     try {
         ParsedPack P = parse_pcpack(g_app.pack->source_path);
-        auto result = do_import(P, g_app.replacements, g_app.align_val);
+        auto result = do_import(P, g_app.replacements, (size_t)g_app.align_val);
         write_file(path, result);
         g_app.add_log("[OK] ", "Built " + path + " (" + format_size(result.size()) + ") with " +
             std::to_string(g_app.replacements.size()) + " replacement(s)");
@@ -844,6 +1256,36 @@ static void action_build(HWND hwnd) {
     } catch (const std::exception& e) {
         g_app.add_log("[ERR] ", std::string("Build failed: ") + e.what());
         MessageBoxA(hwnd, e.what(), "Build Error", MB_ICONERROR);
+    }
+}
+
+static void action_reimport_build(HWND hwnd) {
+    if (!g_app.pack_loaded) return;
+
+    std::string dir = browse_folder(hwnd, "Select folder to reimport (sync + add new + reorder)");
+    if (dir.empty()) return;
+
+    std::string outPath = save_file_dialog(hwnd,
+        "PCPACK Files\0*.pcpack;*.PCPACK\0All Files\0*.*\0",
+        "Save rebuilt PCPACK (Reimport)", "PCPACK");
+    if (outPath.empty()) return;
+
+    try {
+        ParsedPack P = parse_pcpack(g_app.pack->source_path);
+
+        std::string repLog;
+        auto result = do_reimport_from_folder(P, dir, (size_t)g_app.align_val, &repLog);
+        write_file(outPath, result);
+
+        g_app.add_log("[OK] ", "Reimport build OK: " + outPath + " (" + format_size(result.size()) + ")");
+        if (!repLog.empty()) g_app.add_log("[INFO] ", repLog);
+
+        MessageBoxA(hwnd,
+            ("Reimport build complete!\n\nOutput:\n" + outPath + "\n\nSize: " + format_size(result.size())).c_str(),
+            "Reimport Build Complete", MB_ICONINFORMATION);
+    } catch (const std::exception& e) {
+        g_app.add_log("[ERR] ", std::string("Reimport build failed: ") + e.what());
+        MessageBoxA(hwnd, e.what(), "Reimport Build Error", MB_ICONERROR);
     }
 }
 
@@ -919,11 +1361,12 @@ static HMENU create_menu() {
     AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hFile, "File");
 
     HMENU hImport = CreatePopupMenu();
-    AppendMenuA(hImport, MF_STRING, IDM_IMPORT_FILES,   "Add Replacement File...");
-    AppendMenuA(hImport, MF_STRING, IDM_IMPORT_FOLDER,  "Import from Folder...");
+    AppendMenuA(hImport, MF_STRING, IDM_IMPORT_FILES,          "Add Replacement File...");
+    AppendMenuA(hImport, MF_STRING, IDM_IMPORT_FOLDER,         "Import from Folder...");
     AppendMenuA(hImport, MF_SEPARATOR, 0, nullptr);
-    AppendMenuA(hImport, MF_STRING, IDM_IMPORT_BUILD,   "Build PCPACK...");
-    AppendMenuA(hImport, MF_STRING, IDM_IMPORT_CLEAR,   "Clear All Replacements");
+    AppendMenuA(hImport, MF_STRING, IDM_IMPORT_BUILD,          "Build PCPACK...");
+    AppendMenuA(hImport, MF_STRING, IDM_IMPORT_REIMPORT_BUILD, "Reimport (Folder Sync + Reorder) -> Build...");
+    AppendMenuA(hImport, MF_STRING, IDM_IMPORT_CLEAR,          "Clear All Replacements");
     AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hImport, "Import");
 
     return hMenu;
@@ -947,16 +1390,15 @@ static void create_listview(HWND parent) {
     ListView_SetTextBkColor(g_app.hList, RGB(16, 17, 22));
     ListView_SetTextColor(g_app.hList, RGB(200, 204, 212));
 
-    // Columns
     LVCOLUMNA col = {};
     col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
 
-    col.pszText = (LPSTR)"#";       col.cx = 50;  col.fmt = LVCFMT_LEFT;  ListView_InsertColumn(g_app.hList, 0, &col);
-    col.pszText = (LPSTR)"Filename";col.cx = 280; col.fmt = LVCFMT_LEFT;  ListView_InsertColumn(g_app.hList, 1, &col);
-    col.pszText = (LPSTR)"Type";    col.cx = 90;  col.fmt = LVCFMT_LEFT;  ListView_InsertColumn(g_app.hList, 2, &col);
-    col.pszText = (LPSTR)"Hash";    col.cx = 100; col.fmt = LVCFMT_LEFT;  ListView_InsertColumn(g_app.hList, 3, &col);
-    col.pszText = (LPSTR)"Offset";  col.cx = 100; col.fmt = LVCFMT_LEFT;  ListView_InsertColumn(g_app.hList, 4, &col);
-    col.pszText = (LPSTR)"Size";    col.cx = 90;  col.fmt = LVCFMT_RIGHT; ListView_InsertColumn(g_app.hList, 5, &col);
+    col.pszText = (LPSTR)"#";        col.cx = 50;  col.fmt = LVCFMT_LEFT;  ListView_InsertColumn(g_app.hList, 0, &col);
+    col.pszText = (LPSTR)"Filename"; col.cx = 280; col.fmt = LVCFMT_LEFT;  ListView_InsertColumn(g_app.hList, 1, &col);
+    col.pszText = (LPSTR)"Type";     col.cx = 90;  col.fmt = LVCFMT_LEFT;  ListView_InsertColumn(g_app.hList, 2, &col);
+    col.pszText = (LPSTR)"Hash";     col.cx = 100; col.fmt = LVCFMT_LEFT;  ListView_InsertColumn(g_app.hList, 3, &col);
+    col.pszText = (LPSTR)"Offset";   col.cx = 100; col.fmt = LVCFMT_LEFT;  ListView_InsertColumn(g_app.hList, 4, &col);
+    col.pszText = (LPSTR)"Size";     col.cx = 90;  col.fmt = LVCFMT_RIGHT; ListView_InsertColumn(g_app.hList, 5, &col);
 }
 
 static void create_tab(HWND parent) {
@@ -969,7 +1411,7 @@ static void create_tab(HWND parent) {
 
     TCITEMA ti = {};
     ti.mask = TCIF_TEXT;
-    ti.pszText = (LPSTR)"Resources";  TabCtrl_InsertItem(g_app.hTab, 0, &ti);
+    ti.pszText = (LPSTR)"Resources";   TabCtrl_InsertItem(g_app.hTab, 0, &ti);
     ti.pszText = (LPSTR)"Header Info"; TabCtrl_InsertItem(g_app.hTab, 1, &ti);
     ti.pszText = (LPSTR)"Log";         TabCtrl_InsertItem(g_app.hTab, 2, &ti);
 }
@@ -982,37 +1424,28 @@ static void create_children(HWND parent) {
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         FIXED_PITCH, "Consolas");
 
-    // Status bar
     g_app.hStatus = CreateWindowExA(0, STATUSCLASSNAMEA, "",
         WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
         0, 0, 0, 0, parent, (HMENU)IDC_STATUS, GetModuleHandle(nullptr), nullptr);
     SendMessage(g_app.hStatus, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
 
-    // Tab control
     create_tab(parent);
 
-    // Filter edit (placed above list)
     HWND hFilter = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
         0, 0, 300, 24, parent, (HMENU)IDC_FILTER_EDIT,
         GetModuleHandle(nullptr), nullptr);
     SendMessage(hFilter, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
-    // Cue banner
-    SendMessageA(hFilter, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search filename or hash...");
-    // Use wide version for cue banner
     SendMessageW(hFilter, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search filename or hash...");
 
-    // ListView
     create_listview(parent);
 
-    // Log edit (read-only multiline)
     g_app.hLogEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
         WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         0, 0, 100, 100, parent, nullptr,
         GetModuleHandle(nullptr), nullptr);
     SendMessage(g_app.hLogEdit, WM_SETFONT, (WPARAM)g_app.hFontMono, TRUE);
 
-    // Info edit (read-only multiline)
     g_app.hInfoEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
         WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         0, 0, 100, 100, parent, nullptr,
@@ -1031,7 +1464,6 @@ static void do_layout(HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
 
-    // Status bar auto-sizes
     SendMessage(g_app.hStatus, WM_SIZE, 0, 0);
     RECT sr; GetWindowRect(g_app.hStatus, &sr);
     int sh = sr.bottom - sr.top;
@@ -1039,12 +1471,10 @@ static void do_layout(HWND hwnd) {
     int top = 0;
     int bottom = rc.bottom - sh;
 
-    // Tab control at top
     int tabH = 28;
     MoveWindow(g_app.hTab, 0, top, rc.right, tabH, TRUE);
     top += tabH;
 
-    // Filter bar
     int filterH = 26;
     HWND hFilter = GetDlgItem(hwnd, IDC_FILTER_EDIT);
     MoveWindow(hFilter, 4, top + 2, 350, filterH - 4, TRUE);
@@ -1052,7 +1482,6 @@ static void do_layout(HWND hwnd) {
 
     int tabSel = TabCtrl_GetCurSel(g_app.hTab);
 
-    // Show/hide based on tab
     ShowWindow(g_app.hList,     tabSel == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(hFilter,         tabSel == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.hInfoEdit, tabSel == 1 ? SW_SHOW : SW_HIDE);
@@ -1112,12 +1541,10 @@ static void on_lv_customdraw(NMLVCUSTOMDRAW* cd, LRESULT& result) {
             int idx = g_app.filtered[row];
             auto& e = g_app.pack->entries[idx];
 
-            // Row background for replaced items
             if (g_app.replacements.count(idx)) {
                 cd->clrTextBk = RGB(40, 32, 16);
             }
 
-            // Color-code type column and filename if replaced
             if (cd->iSubItem == 2) {
                 cd->clrText = get_type_color(e.ext.c_str());
             } else if (cd->iSubItem == 1 && g_app.replacements.count(idx)) {
@@ -1206,7 +1633,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         int id = LOWORD(wParam);
         int code = HIWORD(wParam);
 
-        // Filter text changed
         if (id == IDC_FILTER_EDIT && code == EN_CHANGE) {
             char buf[256] = {};
             GetDlgItemTextA(hwnd, IDC_FILTER_EDIT, buf, sizeof(buf));
@@ -1221,9 +1647,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             case IDM_FILE_EXPORT_ALL: action_export_all(hwnd); break;
             case IDM_FILE_EXPORT_SEL: action_export_selected(hwnd); break;
             case IDM_FILE_QUIT:       PostQuitMessage(0); break;
+
             case IDM_IMPORT_FILES:    action_import_files(hwnd); break;
             case IDM_IMPORT_FOLDER:   action_import_folder(hwnd); break;
             case IDM_IMPORT_BUILD:    action_build(hwnd); break;
+            case IDM_IMPORT_REIMPORT_BUILD: action_reimport_build(hwnd); break;
+
             case IDM_IMPORT_CLEAR:
                 g_app.replacements.clear();
                 g_app.add_log("[INFO] ", "Cleared all replacements");
@@ -1256,7 +1685,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 return 0;
             }
             if (nm->code == NM_DBLCLK) {
-                // Double-click = export
                 int sel = ListView_GetNextItem(g_app.hList, -1, LVNI_SELECTED);
                 if (sel >= 0 && sel < (int)g_app.filtered.size()) {
                     int idx = g_app.filtered[sel];
@@ -1323,11 +1751,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow);
 
 int main(int argc, char** argv) {
-    // Build command line from argv for WinMain
     std::string cmdLine;
     for (int i = 1; i < argc; ++i) {
         if (i > 1) cmdLine += ' ';
-        // Quote args with spaces
         std::string arg = argv[i];
         if (arg.find(' ') != std::string::npos)
             cmdLine += "\"" + arg + "\"";
@@ -1338,7 +1764,6 @@ int main(int argc, char** argv) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow) {
-    // Enable visual styles
     INITCOMMONCONTROLSEX icc = {};
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_BAR_CLASSES;
@@ -1363,14 +1788,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
         CW_USEDEFAULT, CW_USEDEFAULT, 1100, 700,
         nullptr, create_menu(), hInstance, nullptr);
 
-    // Dark title bar (Windows 10 1809+)
     BOOL dark = TRUE;
     DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark));
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // Handle command line
     if (lpCmdLine && lpCmdLine[0]) {
         std::string arg = lpCmdLine;
         if (arg.front() == '"' && arg.back() == '"') arg = arg.substr(1, arg.size() - 2);
@@ -1390,7 +1813,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
         }
     }
 
-    // Accelerators
     ACCEL accel[] = {
         { FCONTROL | FVIRTKEY, 'O', IDM_FILE_OPEN },
         { FCONTROL | FVIRTKEY, 'D', IDM_FILE_DICT },
